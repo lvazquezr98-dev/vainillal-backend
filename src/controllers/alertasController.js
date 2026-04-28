@@ -1,5 +1,6 @@
 const db = require("../config/database");
 const { successResponse, errorResponse } = require("../utils/helpers");
+const alertEngine = require("../services/alertEngine");
 
 const listar = async (req, res) => {
   try {
@@ -74,4 +75,41 @@ const resolver = async (req, res) => {
   }
 };
 
-module.exports = { listar, resolver };
+const evaluar = async (req, res) => {
+  try {
+    const alertasNuevas = await alertEngine.evaluarTodo();
+    const resumen = await alertEngine.resumenAlertas();
+
+    return successResponse(res, {
+      mensaje: "Evaluación completa ejecutada",
+      alertas_nuevas: alertasNuevas.length,
+      detalle_nuevas: alertasNuevas,
+      resumen_activas: resumen,
+    });
+  } catch (error) {
+    console.error("Error en evaluación de alertas:", error.message);
+    return errorResponse(
+      res,
+      "Error ejecutando evaluación",
+      "INTERNAL_ERROR",
+      500,
+    );
+  }
+};
+
+const resumen = async (req, res) => {
+  try {
+    const data = await alertEngine.resumenAlertas();
+    return successResponse(res, data);
+  } catch (error) {
+    console.error("Error obteniendo resumen de alertas:", error.message);
+    return errorResponse(
+      res,
+      "Error interno del servidor",
+      "INTERNAL_ERROR",
+      500,
+    );
+  }
+};
+
+module.exports = { listar, resolver, evaluar, resumen };

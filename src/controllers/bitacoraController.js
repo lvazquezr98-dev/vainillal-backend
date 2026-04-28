@@ -1,20 +1,11 @@
-// ============================================
-// CONTROLLER DE BITÁCORA
-// ============================================
-// Aquí vive la LÓGICA de cada endpoint de bitácora.
-// El controller recibe el request, valida los datos,
-// habla con la base de datos, y devuelve la respuesta.
-
 const db = require("../config/database");
 const {
   generateId,
-  getWeekNumber,
-  getMonthName,
   successResponse,
   errorResponse,
 } = require("../utils/helpers");
+const alertEngine = require("../services/alertEngine");
 
-// Tipos válidos de actividad (los mismos que definimos en Notion)
 const TIPOS_VALIDOS = [
   "polinización",
   "manejo",
@@ -25,12 +16,8 @@ const TIPOS_VALIDOS = [
   "infraestructura",
 ];
 
-const REGISTRADO_POR_VALIDOS = ["CEO", "Líder de campo", "Sistema"];
-
-// === POST /bitacora — Crear un registro ===
 const crear = async (req, res) => {
   try {
-    // 1. Extraer datos del body
     const {
       actividad,
       fecha,
@@ -42,7 +29,6 @@ const crear = async (req, res) => {
       registrado_por,
     } = req.body;
 
-    // 2. Validar campos requeridos
     if (!actividad || !fecha || !tipo || !registrado_por) {
       return errorResponse(
         res,
@@ -51,7 +37,6 @@ const crear = async (req, res) => {
       );
     }
 
-    // 3. Validar que el tipo sea válido
     if (!TIPOS_VALIDOS.includes(tipo)) {
       return errorResponse(
         res,
@@ -60,20 +45,27 @@ const crear = async (req, res) => {
       );
     }
 
-    // 4. Validar que registrado_por sea válido
-    if (!REGISTRADO_POR_VALIDOS.includes(registrado_por)) {
-      return errorResponse(
-        res,
-        `Registrado por no válido. Opciones: ${REGISTRADO_POR_VALIDOS.join(", ")}`,
-        "INVALID_TYPE",
-      );
-    }
+    const fechaObj = new Date(fecha + "T12:00:00Z");
+    const inicioAnio = new Date(fechaObj.getFullYear(), 0, 1);
+    const semana = Math.ceil(
+      ((fechaObj - inicioAnio) / 86400000 + inicioAnio.getDay() + 1) / 7,
+    );
+    const meses = [
+      "enero",
+      "febrero",
+      "marzo",
+      "abril",
+      "mayo",
+      "junio",
+      "julio",
+      "agosto",
+      "septiembre",
+      "octubre",
+      "noviembre",
+      "diciembre",
+    ];
+    const mes = meses[fechaObj.getMonth()];
 
-    // 5. Calcular semana y mes automáticamente
-    const semana = getWeekNumber(fecha);
-    const mes = getMonthName(fecha);
-
-    // 6. Insertar en PostgreSQL
     const result = await db.query(
       `INSERT INTO bitacora
         (actividad, fecha, tipo, descripcion, datos_numericos,
@@ -94,22 +86,28 @@ const crear = async (req, res) => {
       ],
     );
 
-    // 7. Generar el ID legible (BIT-001, BIT-002, etc.)
     const registro = result.rows[0];
     const id_registro = generateId("BIT", registro.id);
-
-    // 8. Actualizar el registro con el ID legible
     await db.query("UPDATE bitacora SET id_registro = $1 WHERE id = $2", [
       id_registro,
       registro.id,
     ]);
-
     registro.id_registro = id_registro;
 
-    // 9. TODO: Sincronizar a Notion y Google Sheets (se agrega después)
-    registro.sync = { notion: false, sheets: false };
+    // ── MOTOR DE ALERTAS ──
+    let alertas_generadas = [];
+    try {
+      alertas_generadas = await alertEngine.evaluarBitacora(registro);
+    } catch (alertError) {
+      console.error(
+        "[Bitácora] Error en motor de alertas:",
+        alertError.message,
+      );
+    }
 
-    // 10. Responder con éxito
+    registro.sync = { notion: false, sheets: false };
+    registro.alertas_generadas = alertas_generadas;
+
     return successResponse(res, registro, 201);
   } catch (error) {
     console.error("Error creando registro de bitácora:", error.message);
@@ -122,93 +120,67 @@ const crear = async (req, res) => {
   }
 };
 
-// === GET /bitacora — Listar registros con filtros ===
 const listar = async (req, res) => {
   try {
-    // Extraer query parameters con valores por defecto
     const {
       fecha_inicio,
       fecha_fin,
       tipo,
       semana,
+      mes,
+      registrado_por,
       limit = 50,
       offset = 0,
     } = req.query;
 
-    // Construir la query dinámicamente según los filtros
     let query = "SELECT * FROM bitacora WHERE 1=1";
     const params = [];
-    let paramCount = 0;
+    let p = 0;
 
     if (fecha_inicio) {
-      paramCount++;
-      query += ` AND fecha >= $${paramCount}`;
+      p++;
+      query += ` AND fecha >= $${p}`;
       params.push(fecha_inicio);
     }
-
     if (fecha_fin) {
-      paramCount++;
-      query += ` AND fecha <= $${paramCount}`;
+      p++;
+      query += ` AND fecha <= $${p}`;
       params.push(fecha_fin);
     }
-
     if (tipo) {
-      paramCount++;
-      query += ` AND tipo = $${paramCount}`;
+      p++;
+      query += ` AND tipo = $${p}`;
       params.push(tipo);
     }
-
     if (semana) {
-      paramCount++;
-      query += ` AND semana = $${paramCount}`;
+      p++;
+      query += ` AND semana = $${p}`;
       params.push(parseInt(semana));
     }
+    if (mes) {
+      p++;
+      query += ` AND LOWER(mes) = LOWER($${p})`;
+      params.push(mes);
+    }
+    if (registrado_por) {
+      p++;
+      query += ` AND registrado_por = $${p}`;
+      params.push(registrado_por);
+    }
 
-    // Ordenar por fecha más reciente primero
     query += " ORDER BY fecha DESC, created_at DESC";
-
-    // Agregar paginación
-    paramCount++;
-    query += ` LIMIT $${paramCount}`;
+    p++;
+    query += ` LIMIT $${p}`;
     params.push(parseInt(limit));
-
-    paramCount++;
-    query += ` OFFSET $${paramCount}`;
+    p++;
+    query += ` OFFSET $${p}`;
     params.push(parseInt(offset));
 
     const result = await db.query(query, params);
 
-    // Contar total (sin paginación) para informar al frontend
-    let countQuery = "SELECT COUNT(*) FROM bitacora WHERE 1=1";
-    const countParams = [];
-    let countParamNum = 0;
-
-    if (fecha_inicio) {
-      countParamNum++;
-      countQuery += ` AND fecha >= $${countParamNum}`;
-      countParams.push(fecha_inicio);
-    }
-    if (fecha_fin) {
-      countParamNum++;
-      countQuery += ` AND fecha <= $${countParamNum}`;
-      countParams.push(fecha_fin);
-    }
-    if (tipo) {
-      countParamNum++;
-      countQuery += ` AND tipo = $${countParamNum}`;
-      countParams.push(tipo);
-    }
-    if (semana) {
-      countParamNum++;
-      countQuery += ` AND semana = $${countParamNum}`;
-      countParams.push(parseInt(semana));
-    }
-
-    const countResult = await db.query(countQuery, countParams);
-
     return successResponse(res, {
       registros: result.rows,
-      total: parseInt(countResult.rows[0].count),
+      total: result.rows.length,
       limit: parseInt(limit),
       offset: parseInt(offset),
     });
@@ -223,12 +195,14 @@ const listar = async (req, res) => {
   }
 };
 
-// === GET /bitacora/:id — Obtener un registro por ID ===
 const obtenerPorId = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const result = await db.query("SELECT * FROM bitacora WHERE id = $1", [id]);
+    const result = await db.query(
+      "SELECT * FROM bitacora WHERE id = $1 OR id_registro = $1",
+      [id],
+    );
 
     if (result.rows.length === 0) {
       return errorResponse(res, "Registro no encontrado", "NOT_FOUND", 404);

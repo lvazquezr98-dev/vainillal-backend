@@ -4,6 +4,7 @@ const {
   successResponse,
   errorResponse,
 } = require("../utils/helpers");
+const alertEngine = require("../services/alertEngine");
 
 const TIPOS_VALIDOS = ["enfermedad", "plaga", "clima", "otro"];
 const SEVERIDADES_VALIDAS = ["leve", "moderada", "grave"];
@@ -79,7 +80,20 @@ const crear = async (req, res) => {
       registro.id,
     ]);
     registro.id_registro = id_registro;
+
+    // ── MOTOR DE ALERTAS ──
+    let alertas_generadas = [];
+    try {
+      alertas_generadas = await alertEngine.evaluarIncidencia(registro);
+    } catch (alertError) {
+      console.error(
+        "[Incidencias] Error en motor de alertas:",
+        alertError.message,
+      );
+    }
+
     registro.sync = { notion: false, sheets: false };
+    registro.alertas_generadas = alertas_generadas;
 
     return successResponse(res, registro, 201);
   } catch (error) {
@@ -176,7 +190,10 @@ const actualizarEstado = async (req, res) => {
     }
 
     const result = await db.query(
-      `UPDATE incidencias SET estado = $1, accion_tomada = COALESCE($2, accion_tomada) WHERE id = $3 RETURNING *`,
+      `UPDATE incidencias
+       SET estado = $1, accion_tomada = COALESCE($2, accion_tomada)
+       WHERE id = $3
+       RETURNING *`,
       [estado, accion_tomada, id],
     );
 
@@ -184,7 +201,25 @@ const actualizarEstado = async (req, res) => {
       return errorResponse(res, "Incidencia no encontrada", "NOT_FOUND", 404);
     }
 
-    return successResponse(res, result.rows[0]);
+    const registro = result.rows[0];
+
+    // Re-evaluar Fusarium si se resolvió una incidencia relacionada
+    if (
+      estado === "resuelta" &&
+      registro.agente &&
+      registro.agente.toLowerCase().includes("fusarium")
+    ) {
+      try {
+        await alertEngine.evaluarIncidencia(registro);
+      } catch (alertError) {
+        console.error(
+          "[Incidencias] Error re-evaluando alertas:",
+          alertError.message,
+        );
+      }
+    }
+
+    return successResponse(res, registro);
   } catch (error) {
     console.error("Error actualizando incidencia:", error.message);
     return errorResponse(
